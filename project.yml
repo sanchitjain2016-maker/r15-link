@@ -6,7 +6,7 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    MARKETING_VERSION: "0.1"
+    MARKETING_VERSION: "0.2"
     CURRENT_PROJECT_VERSION: "1"
     PRODUCT_BUNDLE_IDENTIFIER: com.sanchit.r15link
     GENERATE_INFOPLIST_FILE: NO
@@ -23,7 +23,7 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: R15 Link
-        CFBundleShortVersionString: "0.1"
+        CFBundleShortVersionString: "0.2"
         CFBundleVersion: "1"
         UILaunchScreen: {}
         UIBackgroundModes:

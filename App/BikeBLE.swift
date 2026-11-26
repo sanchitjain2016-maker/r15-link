@@ -13,9 +13,15 @@ struct LogLine: Identifiable {
     let text: String
 }
 
+struct Found: Identifiable {
+    let id: UUID              // peripheral.identifier
+    var name: String
+    var rssi: Int
+    let peripheral: CBPeripheral
+}
+
 final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
-    // Credentials (from the Yamaha cloud fetch). Editable in the UI.
     @Published var ccuId: String = "0008040003FC92"
     @Published var passKey: String = "447848"
     @Published var passEncoding: String = "ascii"   // ascii | hex | int4 | int3
@@ -24,8 +30,8 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     @Published var connected = false
     @Published var autoReconnect = true
     @Published var log: [LogLine] = []
+    @Published var found: [Found] = []               // discovered devices (tap to connect)
 
-    // Decoded telemetry (filled in as we learn the LocalId formats)
     @Published var lastOpcode: String = "-"
     @Published var rxCount: Int = 0
 
@@ -33,6 +39,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     private var bike: CBPeripheral?
     private var rxChar: CBCharacteristic?
     private var txChar: CBCharacteristic?
+    private var scanning = false
 
     override init() {
         super.init()
@@ -40,27 +47,37 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
             options: [CBCentralManagerOptionRestoreIdentifierKey: "r15link.central"])
     }
 
-    // MARK: logging
     func add(_ kind: String, _ text: String) {
         DispatchQueue.main.async {
             self.log.append(LogLine(kind: kind, text: text))
-            if self.log.count > 600 { self.log.removeFirst(self.log.count - 600) }
+            if self.log.count > 800 { self.log.removeFirst(self.log.count - 800) }
         }
     }
     func clearLog() { DispatchQueue.main.async { self.log.removeAll() } }
 
-    // MARK: control
+    // MARK: scanning — scan for EVERYTHING, match the bike by name
     func start() {
-        guard central.state == .poweredOn else { add("er", "Bluetooth not on"); return }
+        guard central.state == .poweredOn else { add("er", "Bluetooth not on — enable it"); return }
+        found.removeAll()
+        scanning = true
         status = "scanning"
-        add("ev", "scanning for the bike…")
-        central.scanForPeripherals(withServices: [NUS], options: nil)
+        add("ev", "scanning (all devices)…")
+        central.scanForPeripherals(withServices: nil,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
     func stop() {
         autoReconnect = false
-        if let b = bike { central.cancelPeripheralConnection(b) }
+        scanning = false
         central.stopScan()
+        if let b = bike { central.cancelPeripheralConnection(b) }
         status = "stopped"
+    }
+    func connectTo(_ p: CBPeripheral) {
+        central.stopScan(); scanning = false
+        bike = p; p.delegate = self
+        status = "connecting"
+        add("ev", "connecting to \(p.name ?? p.identifier.uuidString)…")
+        central.connect(p, options: nil)
     }
 
     // MARK: frame building
@@ -79,12 +96,12 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         case "hex":  return hexToBytes(passKey)
         case "int4": let n = UInt32(passKey) ?? 0; return [UInt8(n>>24 & 255),UInt8(n>>16 & 255),UInt8(n>>8 & 255),UInt8(n & 255)]
         case "int3": let n = UInt32(passKey) ?? 0; return [UInt8(n>>16 & 255),UInt8(n>>8 & 255),UInt8(n & 255)]
-        default:     return Array(passKey.utf8)   // ascii
+        default:     return Array(passKey.utf8)
         }
     }
     func authFrame() -> Data {
-        var f: [UInt8] = [0x01, 0x01]            // opcode 257 (AuthenticationV2Request), big-endian
-        f += hexToBytes(ccuId)                    // 7 bytes
+        var f: [UInt8] = [0x01, 0x01]
+        f += hexToBytes(ccuId)
         f += passBytes()
         return Data(f)
     }
@@ -95,13 +112,13 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     private func write(_ data: Data, label: String) {
         guard let p = bike, let c = rxChar else { add("er", "not connected"); return }
-        let mtu = p.maximumWriteValueLength(for: .withoutResponse)
+        let mtu = max(1, p.maximumWriteValueLength(for: .withoutResponse))
         let type: CBCharacteristicWriteType =
             c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
         add("tx", "\(label) (\(data.count)B): \(hex(data))")
         var i = 0
         while i < data.count {
-            let end = min(i + max(1, mtu), data.count)
+            let end = min(i + mtu, data.count)
             p.writeValue(data.subdata(in: i..<end), for: c, type: type)
             i = end
         }
@@ -118,17 +135,30 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         switch c.state {
         case .poweredOn: add("ev", "bluetooth on"); if autoReconnect { start() }
         case .poweredOff: status = "bluetooth off"; connected = false
+        case .unauthorized: status = "no BT permission"; add("er", "Bluetooth permission denied — allow it in Settings")
         default: status = "bt: \(c.state.rawValue)"
         }
     }
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                         advertisementData: [String : Any], rssi: NSNumber) {
-        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? "?"
-        add("ev", "found \(name) rssi \(rssi)")
-        central.stopScan()
-        bike = p; p.delegate = self
-        status = "connecting"
-        central.connect(p, options: nil)
+        let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = advName ?? p.name ?? ""
+        // update the discovered list (dedup by identifier)
+        if let idx = found.firstIndex(where: { $0.id == p.identifier }) {
+            found[idx].rssi = rssi.intValue
+            if !name.isEmpty { found[idx].name = name }
+        } else {
+            found.append(Found(id: p.identifier,
+                               name: name.isEmpty ? "(unnamed)" : name,
+                               rssi: rssi.intValue, peripheral: p))
+            add("ev", "found: \(name.isEmpty ? "(unnamed)" : name)  rssi \(rssi)")
+        }
+        // auto-connect to anything that looks like the bike
+        let adv = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        if name.uppercased().contains("YCCU") || adv.contains(NUS) {
+            add("ev", "that's the bike — connecting")
+            connectTo(p)
+        }
     }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         status = "discovering"; connected = true
@@ -138,7 +168,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         connected = false; status = "disconnected"
         add("er", "disconnected\(error != nil ? ": \(error!.localizedDescription)" : "")")
-        if autoReconnect { add("ev", "reconnecting…"); central.connect(p, options: nil) } // persists in background
+        if autoReconnect { add("ev", "reconnecting…"); central.connect(p, options: nil) }
     }
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         add("er", "connect failed\(error != nil ? ": \(error!.localizedDescription)" : "")")
@@ -147,7 +177,12 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     // MARK: CBPeripheralDelegate
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let svc = p.services?.first(where: { $0.uuid == NUS }) else { add("er", "NUS not found"); return }
+        if let e = error { add("er", "service discovery: \(e.localizedDescription)"); return }
+        guard let svc = p.services?.first(where: { $0.uuid == NUS }) else {
+            add("er", "NUS service not found on this device")
+            if let all = p.services { add("ev", "services: " + all.map{$0.uuid.uuidString}.joined(separator: ", ")) }
+            return
+        }
         p.discoverCharacteristics([RX, TX], for: svc)
     }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor svc: CBService, error: Error?) {
@@ -157,7 +192,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         }
         status = "authenticating"
         add("ev", "characteristics ready — sending auth")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self = self else { return }
             self.write(self.authFrame(), label: "AUTH")
         }
@@ -168,6 +203,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         if d.count >= 2 { lastOpcode = String(format: "0x%02X%02X", d[0], d[1]) }
         let ascii = String(d.map { ($0 >= 32 && $0 < 127) ? Character(UnicodeScalar($0)) : "." })
         add("rx", "(\(d.count)B) \(hex(d))  | \(ascii)")
+        if status != "connected" { status = "connected" }
     }
     func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
         if let e = error { add("er", "write error: \(e.localizedDescription)") }

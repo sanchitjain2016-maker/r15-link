@@ -11,6 +11,7 @@ struct ContentView: View {
                 statusBar
                 telemetry
                 controls
+                if !ble.found.isEmpty { devicesList }
                 logView
             }
             .padding(.horizontal, 12)
@@ -57,6 +58,25 @@ struct ContentView: View {
             HStack {
                 TextField("raw hex e.g. 0101…", text: $raw).textFieldStyle(.roundedBorder).font(.system(.footnote, design: .monospaced)).autocapitalization(.none)
                 Button("TX") { ble.sendRaw(raw) }.buttonStyle(.bordered)
+            }
+        }
+    }
+
+    var devicesList: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("devices nearby — tap the bike (YCCU…)").font(.caption).foregroundColor(.secondary)
+            ForEach(ble.found.sorted { $0.rssi > $1.rssi }) { d in
+                Button { ble.connectTo(d.peripheral) } label: {
+                    HStack {
+                        Image(systemName: d.name.uppercased().contains("YCCU") ? "bolt.circle.fill" : "dot.radiowaves.left.and.right")
+                            .foregroundColor(d.name.uppercased().contains("YCCU") ? .green : .secondary)
+                        Text(d.name).font(.system(.footnote, design: .monospaced))
+                        Spacer()
+                        Text("\(d.rssi) dBm").font(.caption2).foregroundColor(.secondary)
+                    }
+                    .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.secondarySystemBackground)).cornerRadius(8)
+                }.buttonStyle(.plain)
             }
         }
     }
