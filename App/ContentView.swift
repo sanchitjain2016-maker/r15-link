@@ -7,30 +7,28 @@ struct ContentView: View {
     @State private var showConfig = false
     @State private var copiedLog = false
 
-    private let accent = Color(red: 1, green: 0.83, blue: 0.25)
-    private let canvas = Color(red: 0.04, green: 0.04, blue: 0.05)
-    private let panel = Color(red: 0.09, green: 0.09, blue: 0.11)
+    private let accent = Color(red: 0.96, green: 0.79, blue: 0.32)
+    private let canvas = Color(white: 0.035)
+    private let panel = Color(white: 0.085)
     private let outline = Color.white.opacity(0.1)
     private let detail = Color.white.opacity(0.67)
 
     var body: some View {
         ZStack {
             canvas.ignoresSafeArea()
-            RadialGradient(colors: [accent.opacity(0.12), .clear],
-                           center: .topTrailing, startRadius: 8, endRadius: 290)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(spacing: 0) {
                     header
-                    connectionPanel
-                    telemetry
-                    if !ble.found.isEmpty { devicesList }
-                    logView
+                    VStack(alignment: .leading, spacing: 12) {
+                        connectionPanel
+                        telemetry
+                        if !ble.found.isEmpty { devicesList }
+                        logView
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 20)
                 }
-                .frame(maxWidth: 520)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 16)
+                .frame(maxWidth: 560)
                 .frame(maxWidth: .infinity)
             }
         }
@@ -40,27 +38,47 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 4) {
-                Capsule().fill(accent).frame(width: 34, height: 3)
-                    .accessibilityHidden(true)
-                Text("R15 LINK")
-                    .font(.system(.largeTitle, design: .monospaced).weight(.black))
-                    .tracking(1)
-                    .accessibilityAddTraits(.isHeader)
+        Color.black
+            .frame(height: 196)
+            .overlay {
+                GeometryReader { geometry in
+                    Image("BatSignal")
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                }
+                .accessibilityHidden(true)
             }
-            Spacer(minLength: 12)
-            Button { showConfig = true } label: {
-                Image(systemName: "gearshape")
-                    .font(.title3.weight(.semibold))
-                    .frame(width: 44, height: 44)
-                    .background(panel, in: RoundedRectangle(cornerRadius: 12))
-                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(outline))
+            .overlay {
+                LinearGradient(stops: [
+                    .init(color: .black.opacity(0.82), location: 0),
+                    .init(color: .clear, location: 0.43),
+                    .init(color: .clear, location: 0.59),
+                    .init(color: canvas, location: 1)
+                ], startPoint: .top, endPoint: .bottom)
+                .allowsHitTesting(false)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(accent)
-            .accessibilityLabel("Settings")
-        }
+            .overlay(alignment: .top) {
+                HStack {
+                    Text("R15 LINK")
+                        .font(.system(.title2, design: .monospaced).weight(.black))
+                        .tracking(2)
+                        .accessibilityAddTraits(.isHeader)
+                    Spacer(minLength: 12)
+                    Button { showConfig = true } label: {
+                        Image(systemName: "gearshape")
+                            .font(.title3.weight(.semibold))
+                            .frame(width: 44, height: 44)
+                            .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(outline))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Settings")
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 10)
+            }
     }
 
     private var connectionPanel: some View {
@@ -113,7 +131,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 5) {
             sectionTitle(title)
             Text(value).font(.system(.title2, design: .monospaced).weight(.semibold))
-                .foregroundStyle(accent)
+                .foregroundStyle(.white)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)

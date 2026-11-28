@@ -6,8 +6,8 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    MARKETING_VERSION: "0.6"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "0.7"
+    CURRENT_PROJECT_VERSION: "6"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     PRODUCT_BUNDLE_IDENTIFIER: com.sanchit.r15link
     GENERATE_INFOPLIST_FILE: NO
@@ -24,8 +24,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: R15 Link
-        CFBundleShortVersionString: "0.6"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "0.7"
+        CFBundleVersion: "6"
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central

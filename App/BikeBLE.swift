@@ -22,6 +22,9 @@ struct Found: Identifiable {
 }
 
 final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    private enum EncryptionRecovery {
+        case none, retryingSubscription, reconnecting
+    }
 
     @Published var ccuId: String = "0008040003FC92"
     @Published var passKey: String = "447848"
@@ -34,6 +37,9 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
                 retry?.cancel()
                 if waitingForBike {
                     clearLink()
+                    status = "automatic reconnect off"
+                } else if encryptionRecovery == .reconnecting, bike == nil {
+                    deadline?.cancel()
                     status = "automatic reconnect off"
                 } else if let failure = lastFailure, bike == nil, !central.isScanning {
                     status = failure
@@ -63,6 +69,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     private var writeInFlight = false
     private var retryRegistrationAfterWrite = false
     private var waitingForBike = false
+    private var encryptionRecovery = EncryptionRecovery.none
     private var linkReadyAt: Date?
     private var linkOpenedAt: Date?
     private var wantsConnection = false
@@ -119,6 +126,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         wantsConnection = true
         attempts = 0
         lastFailure = nil
+        encryptionRecovery = .none
         beginScan(automatic: true)
     }
 
@@ -161,6 +169,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         guard central.state == .poweredOn, bike == nil else { return }
         wantsConnection = true
         lastFailure = nil
+        encryptionRecovery = .none
         attempts = 0
         beginConnection(p)
     }
@@ -496,17 +505,55 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         txChar = notify
         status = "enabling bike notifications"
         add("ev", status)
+        subscribe(p, to: notify)
+    }
+
+    private func subscribe(_ p: CBPeripheral, to notify: CBCharacteristic) {
         p.setNotifyValue(true, for: notify)
         setDeadline(seconds: 10) { $0.fail("bike notification subscription timed out", retryable: false) }
     }
+
+    private func recoverEncryption(_ p: CBPeripheral, on ch: CBCharacteristic, error: Error) -> Bool {
+        let failure = error as NSError
+        guard failure.domain == CBATTErrorDomain,
+              failure.code == CBATTError.Code.insufficientEncryption.rawValue ||
+              failure.code == CBATTError.Code.insufficientAuthentication.rawValue else { return false }
+        add("er", "bike rejected the protected notification subscription" + connectionError(error))
+        switch encryptionRecovery {
+        case .none:
+            encryptionRecovery = .retryingSubscription
+            status = "retrying encrypted Bluetooth subscription"
+            add("ev", status)
+            setDeadline(seconds: 1.5) { manager in
+                guard manager.bike === p, manager.txChar === ch else { return }
+                manager.subscribe(p, to: ch)
+            }
+        case .retryingSubscription where autoReconnect && wantsConnection && p.identifier == savedBikeID:
+            encryptionRecovery = .reconnecting
+            clearLink()
+            status = "reconnecting once with the saved pairing"
+            add("ev", status)
+            setDeadline(seconds: 2) { manager in
+                guard manager.central.state == .poweredOn, manager.wantsConnection,
+                      manager.autoReconnect, manager.bike == nil else { return }
+                manager.beginConnection(p)
+            }
+        default:
+            fail("Bike rejected Bluetooth encryption with the saved pairing", retryable: false)
+        }
+        return true
+    }
+
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
         guard bike === p, txChar === ch else { return }
         guard error == nil, ch.isNotifying else {
-            fail("bike notification subscription failed" + (error.map { ": \($0.localizedDescription)" } ?? ""), retryable: false)
+            if let error = error, recoverEncryption(p, on: ch, error: error) { return }
+            fail("bike notification subscription failed" + connectionError(error), retryable: false)
             return
         }
         guard linkReadyAt == nil else { return }
         deadline?.cancel()
+        encryptionRecovery = .none
         linkReadyAt = Date()
         UserDefaults.standard.set(p.identifier.uuidString, forKey: savedBikeKey)
         status = "Bluetooth ready — authenticating"
