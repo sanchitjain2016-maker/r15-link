@@ -6,9 +6,9 @@ workflows:
     environment:
       xcode: latest
     scripts:
-      - name: Verify SCCU authentication framing
+      - name: Verify SCCU authentication and ride data
         script: |
-          swiftc App/SccuAuthentication.swift Tests/SccuAuthentication/main.swift -o "$TMPDIR/r15-auth-test"
+          swiftc App/SccuAuthentication.swift App/RideTelemetry.swift Tests/SccuAuthentication/main.swift -o "$TMPDIR/r15-auth-test"
           "$TMPDIR/r15-auth-test"
       - name: Install XcodeGen
         script: brew install xcodegen

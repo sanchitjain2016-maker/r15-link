@@ -6,8 +6,8 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    MARKETING_VERSION: "0.7"
-    CURRENT_PROJECT_VERSION: "6"
+    MARKETING_VERSION: "0.8"
+    CURRENT_PROJECT_VERSION: "7"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     PRODUCT_BUNDLE_IDENTIFIER: com.sanchit.r15link
     GENERATE_INFOPLIST_FILE: NO
@@ -24,12 +24,14 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: R15 Link
-        CFBundleShortVersionString: "0.7"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "0.8"
+        CFBundleVersion: "7"
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
         NSBluetoothAlwaysUsageDescription: "Connects to your Yamaha R15 M over Bluetooth to show live ride data and hold the link."
         NSBluetoothPeripheralUsageDescription: "Connects to your Yamaha R15 M over Bluetooth."
+        NSAppleMusicUsageDescription: "Show the current Apple Music track and control playback from R15 Link."
+        NSLocationWhenInUseUsageDescription: "Save where you parked the bike using this iPhone’s location."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

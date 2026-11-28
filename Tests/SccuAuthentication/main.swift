@@ -26,3 +26,35 @@ precondition(parser.accept(Data(accepted.dropLast()) + Data([0])) == nil)
 precondition(parser.accept(Data(rejected)) == false)
 precondition(parser.accept(Data(accepted)) == true)
 print("SCCU registration, reconnect, and reply validation checks passed.")
+
+func uartFrame(_ records: [UInt8]) -> Data {
+    var bytes: [UInt8] = [0x6B] + records + [7]
+    bytes.append(0 &- bytes.reduce(0, &+))
+    return Data(bytes)
+}
+var measurements = [UInt8](repeating: 0, count: 20)
+measurements[0] = 0x0B
+measurements[1] = 0xB8
+measurements[2] = 42
+measurements[6] = 184
+measurements[8] = 64
+measurements[14] = 108
+measurements[19] = 131
+let rideFrame = uartFrame([2, 0, 1, 20] + measurements + [0, 0x48, 4, 0, 0, 0x30, 0x39])
+for split in 1..<rideFrame.count {
+    var stream = RideTelemetryStream()
+    var data = RideTelemetry()
+    precondition(!stream.ingest(Data(rideFrame.prefix(split)), into: &data))
+    precondition(data.speed == nil)
+    precondition(stream.ingest(Data(rideFrame.dropFirst(split)), into: &data))
+    precondition(data.speed == 42 && data.rpm == 3_000 && data.gear == 3)
+    precondition(data.coolant == 78 && data.throttle == 25 && data.odometer == 1_234.5)
+    precondition(abs((data.battery ?? 0) - 13.4765625) < 0.00001)
+}
+var stream = RideTelemetryStream()
+var reading = RideTelemetry()
+var invalidRideFrame = rideFrame
+invalidRideFrame[invalidRideFrame.count - 1] ^= 1
+precondition(!stream.ingest(invalidRideFrame, into: &reading))
+precondition(reading.speed == nil)
+print("Ride telemetry, fragmentation, checksum, and unit checks passed.")

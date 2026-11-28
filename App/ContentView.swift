@@ -6,6 +6,12 @@ struct ContentView: View {
     @State private var raw = ""
     @State private var showConfig = false
     @State private var copiedLog = false
+    @State private var activeTool: Tool?
+
+    private enum Tool: String, Identifiable {
+        case phone, navigation, history, fuel
+        var id: String { rawValue }
+    }
 
     private let accent = Color(red: 0.96, green: 0.79, blue: 0.32)
     private let canvas = Color(white: 0.035)
@@ -22,6 +28,7 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         connectionPanel
                         telemetry
+                        rideTools
                         if !ble.found.isEmpty { devicesList }
                         logView
                     }
@@ -35,6 +42,15 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .tint(accent)
         .sheet(isPresented: $showConfig) { settings }
+        .sheet(item: $activeTool) { tool in
+            NavigationView {
+                toolView(tool)
+                    .toolbar { Button("Done") { activeTool = nil } }
+            }
+            .navigationViewStyle(.stack)
+            .preferredColorScheme(.dark)
+            .tint(accent)
+        }
     }
 
     private var header: some View {
@@ -121,9 +137,56 @@ struct ContentView: View {
     }
 
     private var telemetry: some View {
-        HStack(spacing: 10) {
-            tile("Packets", "\(ble.rxCount)")
-            tile("Last opcode", ble.lastOpcode)
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("Live bike data")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140))], spacing: 8) {
+                tile("Speed", ble.telemetry.speed.map { "\($0) km/h" } ?? "—")
+                tile("Engine", ble.telemetry.rpm.map { "\($0) rpm" } ?? "—")
+                tile("Odometer", number(ble.telemetry.odometer, unit: "km"))
+                tile("Battery", number(ble.telemetry.battery, unit: "V"))
+                tile("Gear", ble.telemetry.gear.map { $0 == 0 ? "N" : "\($0)" } ?? "—")
+                tile("Coolant", ble.telemetry.coolant.map { "\($0) °C" } ?? "—")
+                tile("Throttle", number(ble.telemetry.throttle, unit: "%"))
+            }
+            if !ble.connected {
+                Text("Live readings appear after Yamaha authentication.")
+                    .font(.caption).foregroundStyle(detail)
+            }
+        }
+    }
+
+    private func number(_ value: Double?, unit: String) -> String {
+        value.map { $0.formatted(.number.precision(.fractionLength(1))) + " " + unit } ?? "—"
+    }
+
+    private var rideTools: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 145))], spacing: 8) {
+            toolButton("Phone & media", icon: "headphones", tool: .phone)
+            toolButton("Navigation", icon: "location", tool: .navigation)
+            toolButton("Ride history", icon: "clock.arrow.circlepath", tool: .history)
+            toolButton("Fuel log", icon: "fuelpump", tool: .fuel)
+        }
+    }
+
+    private func toolButton(_ title: String, icon: String, tool: Tool) -> some View {
+        Button { activeTool = tool } label: {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                .padding(.horizontal, 12)
+                .panelSurface(panel, outline: outline)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(accent)
+    }
+
+    @ViewBuilder
+    private func toolView(_ tool: Tool) -> some View {
+        switch tool {
+        case .phone: PhoneToolsView().environmentObject(ble)
+        case .navigation: NavigationToolsView()
+        case .history: RideHistoryView().environmentObject(ble)
+        case .fuel: FuelLogView().environmentObject(ble)
         }
     }
 
@@ -186,6 +249,9 @@ struct ContentView: View {
                     .foregroundStyle(detail)
             }
             .font(.caption.weight(.semibold))
+            Text("\(ble.rxCount) packets · Last opcode \(ble.lastOpcode)")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(detail)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {

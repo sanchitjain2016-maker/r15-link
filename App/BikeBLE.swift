@@ -1,6 +1,7 @@
 import Foundation
 import CoreBluetooth
 import Combine
+import UserNotifications
 
 // Nordic UART used by Yamaha SCCU.
 private let NUS = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -52,6 +53,13 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     @Published var lastOpcode: String = "-"
     @Published var rxCount: Int = 0
+    @Published private(set) var telemetry = RideTelemetry()
+    @Published private(set) var notificationSharing = false
+    @Published private(set) var rideHistory: [RideSummary] = []
+    private var telemetryStream = RideTelemetryStream()
+    private var activeRide: ActiveRide?
+    private var lastPacketLog = Date.distantPast
+    private let historyKey = "r15link.rideHistory"
 
     private var central: CBCentralManager!
     private var bike: CBPeripheral?
@@ -89,6 +97,10 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     override init() {
         super.init()
+        if let data = UserDefaults.standard.data(forKey: historyKey),
+           let rides = try? JSONDecoder().decode([RideSummary].self, from: data) {
+            rideHistory = rides
+        }
         central = CBCentralManager(delegate: self, queue: nil,
             options: [CBCentralManagerOptionRestoreIdentifierKey: "r15link.central"])
     }
@@ -240,6 +252,16 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     private func clearLink() {
         let current = bike
+        if let summary = activeRide?.summary() {
+            rideHistory.insert(summary, at: 0)
+            rideHistory = Array(rideHistory.prefix(200))
+            UserDefaults.standard.set(try? JSONEncoder().encode(rideHistory), forKey: historyKey)
+        }
+        if connected { postConnectionAlert(connected: false) }
+        activeRide = nil
+        telemetry = RideTelemetry()
+        telemetryStream = RideTelemetryStream()
+        notificationSharing = false
         bike = nil
         rxChar = nil
         txChar = nil
@@ -357,7 +379,19 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         add(accepted ? "ev" : "er", reason)
         if accepted {
             UserDefaults.standard.set(true, forKey: registrationKey)
+            activeRide = ActiveRide()
+            postConnectionAlert(connected: true)
         }
+    }
+
+    private func postConnectionAlert(connected: Bool) {
+        guard UserDefaults.standard.bool(forKey: "r15link.connectionAlerts") else { return }
+        let content = UNMutableNotificationContent()
+        content.title = connected ? "Bike connected" : "Bike disconnected"
+        content.body = connected ? "Yamaha Bluetooth authentication succeeded." : "R15 Link lost the Bluetooth session."
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "r15link.connection", content: content, trigger: nil)
+        ) { _ in }
     }
 
     func sendRaw(_ s: String) {
@@ -442,6 +476,11 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         guard bike === p, waitingForBike || status == "connecting" else { return }
         discover(p)
+    }
+
+    func centralManager(_ c: CBCentralManager, didUpdateANCSAuthorizationFor p: CBPeripheral) {
+        guard bike === p else { return }
+        notificationSharing = p.ancsAuthorized
     }
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         guard bike === p else { return }
@@ -555,6 +594,7 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         deadline?.cancel()
         encryptionRecovery = .none
         linkReadyAt = Date()
+        notificationSharing = p.ancsAuthorized
         UserDefaults.standard.set(p.identifier.uuidString, forKey: savedBikeKey)
         status = "Bluetooth ready — authenticating"
         add("ev", "bike notifications enabled")
@@ -566,8 +606,11 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         guard let d = ch.value, !d.isEmpty else { return }
         rxCount += 1
         if d.count >= 2 { lastOpcode = String(format: "0x%02X%02X", d[0], d[1]) }
-        let hex = d.map { String(format: "%02x", $0) }.joined(separator: " ")
-        add("rx", "(\(d.count)B) \(hex)")
+        if Date().timeIntervalSince(lastPacketLog) >= 0.5 || waitingForAuth {
+            lastPacketLog = Date()
+            let hex = d.map { String(format: "%02x", $0) }.joined(separator: " ")
+            add("rx", "(\(d.count)B) \(hex)")
+        }
         if waitingForAuth, let accepted = replyParser.accept(d) {
             let retryRegistration = !accepted && !registeringPhone
             finishAuthentication(accepted: accepted,
@@ -577,6 +620,12 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
                 if writeInFlight { retryRegistrationAfterWrite = true }
                 else { beginAuthentication(register: true) }
             }
+        }
+        if connected {
+            var sample = telemetry
+            let sampledSpeed = telemetryStream.ingest(d, into: &sample)
+            if sample != telemetry { telemetry = sample }
+            activeRide?.update(sample, sampledSpeed: sampledSpeed)
         }
     }
     func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
