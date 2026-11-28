@@ -29,7 +29,19 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     @Published var status: String = "idle"
     @Published var connected = false
-    @Published var autoReconnect = true
+    @Published var autoReconnect = true {
+        didSet {
+            if !autoReconnect {
+                retry?.cancel()
+                if waitingForBike {
+                    clearLink()
+                    status = "automatic reconnect off"
+                } else if let failure = lastFailure, bike == nil, !central.isScanning {
+                    status = failure
+                }
+            }
+        }
+    }
     @Published var log: [LogLine] = []
     @Published var found: [Found] = []               // discovered devices (tap to connect)
 
@@ -45,10 +57,18 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     private var attempts = 0
     private var allowAutomaticSelection = false
     private var waitingForAuth = false
+    private var waitingForBike = false
     private var linkReadyAt: Date?
+    private var linkOpenedAt: Date?
     private var wantsConnection = false
     private var lastFailure: String?
     private let savedBikeKey = "r15link.knownBike"
+    private var savedBikeID: UUID? {
+        UserDefaults.standard.string(forKey: savedBikeKey).flatMap(UUID.init(uuidString:))
+    }
+    private var expectedName: String {
+        "YCCU_" + ccuId.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
 
     override init() {
         super.init()
@@ -80,6 +100,10 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
             add("er", status)
             return
         }
+        if waitingForBike {
+            add("ev", "manual scan requested while waiting for the saved bike")
+            clearLink()
+        }
         guard bike == nil, !central.isScanning else { return }
         retry?.cancel()
         wantsConnection = true
@@ -97,6 +121,12 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         setDeadline(seconds: 15) { manager in
             manager.central.stopScan()
+            let sawBike = manager.found.contains {
+                $0.id == manager.savedBikeID || $0.name.uppercased() == manager.expectedName
+            }
+            if !sawBike, manager.autoReconnect, manager.wantsConnection, manager.waitForSavedBike() {
+                return
+            }
             if let failure = manager.lastFailure {
                 manager.status = "connection failed — tap to retry"
                 manager.add("er", "last failure: \(failure)")
@@ -124,6 +154,32 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         beginConnection(p)
     }
 
+    private func waitForSavedBike() -> Bool {
+        guard let id = savedBikeID,
+              let saved = central.retrievePeripherals(withIdentifiers: [id]).first else { return false }
+        waitForBike(saved)
+        return true
+    }
+
+    private func waitForBike(_ p: CBPeripheral) {
+        retry?.cancel()
+        deadline?.cancel()
+        central.stopScan()
+        bike = p
+        p.delegate = self
+        waitingForBike = true
+        status = "waiting for bike ignition"
+        add("ev", "iOS reconnect pending for the saved bike")
+        switch p.state {
+        case .connected:
+            discover(p)
+        case .connecting:
+            break
+        default:
+            central.connect(p, options: nil)
+        }
+    }
+
     private func beginConnection(_ p: CBPeripheral) {
         retry?.cancel()
         central.stopScan()
@@ -141,9 +197,14 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     }
 
     private func discover(_ p: CBPeripheral) {
+        waitingForBike = false
+        linkOpenedAt = Date()
+        if p.name?.uppercased() == expectedName {
+            UserDefaults.standard.set(p.identifier.uuidString, forKey: savedBikeKey)
+        }
         status = "discovering services"
-        add("ev", "Bluetooth connected, discovering services")
-        p.discoverServices(nil)
+        add("ev", "Bluetooth connected, discovering the bike service")
+        p.discoverServices([NUS])
         setDeadline(seconds: 10) { $0.fail("service discovery timed out", retryable: false) }
     }
 
@@ -163,7 +224,9 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         rxChar = nil
         txChar = nil
         waitingForAuth = false
+        waitingForBike = false
         linkReadyAt = nil
+        linkOpenedAt = nil
         connected = false
         if let current = current, current.state != .disconnected {
             central.cancelPeripheralConnection(current)
@@ -199,6 +262,16 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         case .resetting: return "Bluetooth is restarting"
         default: return "Bluetooth is starting"
         }
+    }
+
+    private func connectionError(_ error: Error?) -> String {
+        guard let failure = error as NSError? else { return "" }
+        return ": \(failure.localizedDescription) [\(failure.domain) \(failure.code)]"
+    }
+
+    private func pairingWasRemoved(_ error: Error?) -> Bool {
+        guard let failure = error as NSError? else { return false }
+        return failure.domain == CBErrorDomain && failure.code == CBError.Code.peerRemovedPairingInformation.rawValue
     }
 
     // MARK: frame building
@@ -271,9 +344,8 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
 
     // MARK: CBCentralManagerDelegate
     func centralManager(_ c: CBCentralManager, willRestoreState dict: [String : Any]) {
-        let saved = UserDefaults.standard.string(forKey: savedBikeKey)
         if let ps = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
-           let p = ps.first(where: { $0.identifier.uuidString == saved }) {
+           let p = ps.first(where: { $0.identifier == savedBikeID }) {
             bike = p; p.delegate = self
             wantsConnection = true
             add("ev", "restored known bike")
@@ -284,9 +356,10 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
         add(c.state == .poweredOn ? "ev" : "er", status)
         if c.state == .poweredOn {
             if let restored = bike {
-                beginConnection(restored)
+                waitForBike(restored)
             } else if autoReconnect {
-                start()
+                wantsConnection = true
+                if !waitForSavedBike() { start() }
             }
         } else if c.state != .unknown {
             retry?.cancel()
@@ -307,28 +380,52 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
             found.append(Found(id: p.identifier,
                                name: name.isEmpty ? "(unnamed)" : name,
                                rssi: rssi.intValue, peripheral: p))
-            add("ev", "found: \(name.isEmpty ? "(unnamed)" : name)  rssi \(rssi)")
+            if name.uppercased() == expectedName || p.identifier == savedBikeID {
+                add("ev", "found bike: \(name.isEmpty ? "(unnamed)" : name) — RSSI \(rssi)")
+            }
         }
-        let expectedName = "YCCU_" + ccuId.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        let saved = UserDefaults.standard.string(forKey: savedBikeKey)
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
         if allowAutomaticSelection, isConnectable,
-           name.uppercased() == expectedName || p.identifier.uuidString == saved {
+           name.uppercased() == expectedName || p.identifier == savedBikeID {
+            if name.uppercased() == expectedName {
+                UserDefaults.standard.set(p.identifier.uuidString, forKey: savedBikeKey)
+            }
             beginConnection(p)
         }
     }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        guard bike === p, status == "connecting" else { return }
+        guard bike === p, waitingForBike || status == "connecting" else { return }
         discover(p)
     }
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         guard bike === p else { return }
-        if let ready = linkReadyAt, Date().timeIntervalSince(ready) >= 60 { attempts = 0 }
-        fail("Bluetooth disconnected" + (error.map { ": \($0.localizedDescription)" } ?? ""))
+        if pairingWasRemoved(error) {
+            fail("bike removed the saved Bluetooth pairing" + connectionError(error), retryable: false)
+            return
+        }
+        let duration = linkOpenedAt.map { Int(Date().timeIntervalSince($0) * 1000) }
+        let reason = "Bluetooth disconnected" + (duration.map { " after \($0) ms" } ?? "") + connectionError(error)
+        let transportWasReady = linkReadyAt != nil
+        if transportWasReady, error == nil || (duration ?? 0) >= 15_000,
+           autoReconnect, wantsConnection, central.state == .poweredOn, p.identifier == savedBikeID {
+            add("er", reason)
+            clearLink()
+            attempts = 0
+            lastFailure = nil
+            waitForBike(p)
+            return
+        }
+        if attempts == 0 { attempts = 1 }
+        fail(reason)
     }
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         guard bike === p else { return }
-        fail("Bluetooth connection failed" + (error.map { ": \($0.localizedDescription)" } ?? ""))
+        if pairingWasRemoved(error) {
+            fail("bike removed the saved Bluetooth pairing" + connectionError(error), retryable: false)
+            return
+        }
+        if attempts == 0 { attempts = 1 }
+        fail("Bluetooth connection failed" + connectionError(error))
     }
 
     // MARK: CBPeripheralDelegate
