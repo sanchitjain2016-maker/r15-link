@@ -1,9 +1,11 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @EnvironmentObject var ble: BikeBLE
     @State private var raw = ""
     @State private var showConfig = false
+    @State private var copiedLog = false
 
     var body: some View {
         NavigationView {
@@ -25,6 +27,8 @@ struct ContentView: View {
         HStack {
             Circle().fill(ble.connected ? .green : .gray).frame(width: 10, height: 10)
             Text(ble.status).font(.subheadline.weight(.semibold))
+            Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"))
+                .font(.caption).foregroundColor(.secondary)
             Spacer()
             Toggle("auto-reconnect", isOn: $ble.autoReconnect).labelsHidden()
             Text("auto").font(.caption).foregroundColor(.secondary)
@@ -65,26 +69,39 @@ struct ContentView: View {
     var devicesList: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("devices nearby — tap the bike (YCCU…)").font(.caption).foregroundColor(.secondary)
-            ForEach(ble.found.sorted { $0.rssi > $1.rssi }) { d in
-                Button { ble.connectTo(d.peripheral) } label: {
-                    HStack {
-                        Image(systemName: d.name.uppercased().contains("YCCU") ? "bolt.circle.fill" : "dot.radiowaves.left.and.right")
-                            .foregroundColor(d.name.uppercased().contains("YCCU") ? .green : .secondary)
-                        Text(d.name).font(.system(.footnote, design: .monospaced))
-                        Spacer()
-                        Text("\(d.rssi) dBm").font(.caption2).foregroundColor(.secondary)
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(ble.found.sorted { $0.rssi > $1.rssi }) { d in
+                        Button { ble.connectTo(d.peripheral) } label: {
+                            HStack {
+                                Image(systemName: d.name.uppercased().contains("YCCU") ? "bolt.circle.fill" : "dot.radiowaves.left.and.right")
+                                    .foregroundColor(d.name.uppercased().contains("YCCU") ? .green : .secondary)
+                                Text(d.name).font(.system(.footnote, design: .monospaced))
+                                Spacer()
+                                Text("\(d.rssi) dBm").font(.caption2).foregroundColor(.secondary)
+                            }
+                            .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(.secondarySystemBackground)).cornerRadius(8)
+                        }.buttonStyle(.plain)
                     }
-                    .padding(8).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(.secondarySystemBackground)).cornerRadius(8)
-                }.buttonStyle(.plain)
+                }
             }
+            .frame(height: CGFloat(min(ble.found.count, 3)) * 42)
         }
     }
 
     var logView: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack { Text("log").font(.caption).foregroundColor(.secondary); Spacer()
-                Button("clear") { ble.clearLog() }.font(.caption) }
+            HStack {
+                Text("log").font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button(copiedLog ? "Copied" : "Copy Log") {
+                    UIPasteboard.general.string = ble.diagnosticLog
+                    copiedLog = true
+                }.font(.caption).disabled(ble.log.isEmpty)
+                Button("Clear") { ble.clearLog() }.font(.caption)
+            }
+            .onChange(of: ble.log.count) { _ in copiedLog = false }
             ScrollViewReader { pr in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {

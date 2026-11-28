@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import Combine
 
 // Nordic UART Service (the bike's "motoconsdk" transport)
 private let NUS = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -39,7 +40,15 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     private var bike: CBPeripheral?
     private var rxChar: CBCharacteristic?
     private var txChar: CBCharacteristic?
-    private var scanning = false
+    private var deadline: DispatchWorkItem?
+    private var retry: DispatchWorkItem?
+    private var attempts = 0
+    private var allowAutomaticSelection = false
+    private var waitingForAuth = false
+    private var linkReadyAt: Date?
+    private var wantsConnection = false
+    private var lastFailure: String?
+    private let savedBikeKey = "r15link.knownBike"
 
     override init() {
         super.init()
@@ -55,29 +64,141 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     }
     func clearLog() { DispatchQueue.main.async { self.log.removeAll() } }
 
-    // MARK: scanning — scan for EVERYTHING, match the bike by name
+    var diagnosticLog: String {
+        let clock = ISO8601DateFormatter()
+        return log.map { line in
+            let detail = ["tx", "rx"].contains(line.kind)
+                ? "[packet contents omitted]"
+                : line.text
+            return "\(clock.string(from: line.t)) \(line.kind.uppercased()) \(detail)"
+        }.joined(separator: "\n")
+    }
+
     func start() {
-        guard central.state == .poweredOn else { add("er", "Bluetooth not on — enable it"); return }
-        found.removeAll()
-        scanning = true
+        guard central.state == .poweredOn else {
+            status = bluetoothStatus(central.state)
+            add("er", status)
+            return
+        }
+        guard bike == nil, !central.isScanning else { return }
+        retry?.cancel()
+        wantsConnection = true
+        attempts = 0
+        lastFailure = nil
+        beginScan(automatic: true)
+    }
+
+    private func beginScan(automatic: Bool) {
+        allowAutomaticSelection = automatic
         status = "scanning"
+        found.removeAll()
         add("ev", "scanning (all devices)…")
         central.scanForPeripherals(withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        setDeadline(seconds: 15) { manager in
+            manager.central.stopScan()
+            if let failure = manager.lastFailure {
+                manager.status = "connection failed — tap to retry"
+                manager.add("er", "last failure: \(failure)")
+            } else {
+                manager.status = manager.found.isEmpty ? "no Bluetooth devices found" : "bike not found — select it or retry"
+                manager.add("er", "\(manager.status) (\(manager.found.count) devices)")
+            }
+        }
     }
+
     func stop() {
-        autoReconnect = false
-        scanning = false
+        wantsConnection = false
+        retry?.cancel()
+        deadline?.cancel()
         central.stopScan()
-        if let b = bike { central.cancelPeripheralConnection(b) }
+        clearLink()
         status = "stopped"
     }
+
     func connectTo(_ p: CBPeripheral) {
-        central.stopScan(); scanning = false
-        bike = p; p.delegate = self
+        guard central.state == .poweredOn, bike == nil else { return }
+        wantsConnection = true
+        lastFailure = nil
+        attempts = 0
+        beginConnection(p)
+    }
+
+    private func beginConnection(_ p: CBPeripheral) {
+        retry?.cancel()
+        central.stopScan()
+        attempts += 1
+        bike = p
+        p.delegate = self
         status = "connecting"
-        add("ev", "connecting to \(p.name ?? p.identifier.uuidString)…")
-        central.connect(p, options: nil)
+        add("ev", "connecting to \(p.name ?? p.identifier.uuidString) (attempt \(attempts) of 3)")
+        if p.state == .connected {
+            discover(p)
+        } else {
+            central.connect(p, options: nil)
+            setDeadline(seconds: 12) { $0.fail("Bluetooth connection timed out") }
+        }
+    }
+
+    private func discover(_ p: CBPeripheral) {
+        status = "discovering services"
+        add("ev", "Bluetooth connected, discovering services")
+        p.discoverServices(nil)
+        setDeadline(seconds: 10) { $0.fail("service discovery timed out", retryable: false) }
+    }
+
+    private func setDeadline(seconds: Double, action: @escaping (BikeBLE) -> Void) {
+        deadline?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            action(self)
+        }
+        deadline = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: task)
+    }
+
+    private func clearLink() {
+        let current = bike
+        bike = nil
+        rxChar = nil
+        txChar = nil
+        waitingForAuth = false
+        linkReadyAt = nil
+        connected = false
+        if let current = current, current.state != .disconnected {
+            central.cancelPeripheralConnection(current)
+        }
+    }
+
+    private func fail(_ reason: String, retryable: Bool = true) {
+        guard bike != nil else { return }
+        deadline?.cancel()
+        clearLink()
+        lastFailure = reason
+        status = reason
+        add("er", reason)
+        guard retryable, autoReconnect, wantsConnection, central.state == .poweredOn else { return }
+        let delay = attempts >= 3 ? 4 : Double(max(1, attempts) * 2)
+        status = attempts >= 3 ? "retry limit reached — checking nearby devices" : "retrying in \(Int(delay))s"
+        add("ev", status)
+        let task = DispatchWorkItem { [weak self] in
+            guard let self = self, self.autoReconnect, self.wantsConnection,
+                  self.central.state == .poweredOn, self.bike == nil else { return }
+            self.beginScan(automatic: self.attempts < 3)
+        }
+        retry = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: task)
+    }
+
+    private func bluetoothStatus(_ state: CBManagerState) -> String {
+        switch state {
+        case .poweredOn: return "Bluetooth ready"
+        case .poweredOff: return "Bluetooth is off"
+        case .unauthorized: return "Bluetooth permission denied — allow it in Settings"
+        case .unsupported: return "Bluetooth LE unavailable"
+        case .resetting: return "Bluetooth is restarting"
+        default: return "Bluetooth is starting"
+        }
     }
 
     // MARK: frame building
@@ -107,42 +228,77 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
     }
     func hex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined(separator: " ") }
 
-    func sendAuth() { write(authFrame(), label: "AUTH") }
+    func sendAuth() {
+        guard !waitingForAuth else { return }
+        guard write(authFrame(), label: "AUTH") else { return }
+        waitingForAuth = true
+        status = "waiting for bike authentication reply"
+        setDeadline(seconds: 8) { manager in
+            manager.waitingForAuth = false
+            manager.status = "authentication reply timed out"
+            manager.add("er", "no bike response after AUTH")
+        }
+    }
     func sendRaw(_ s: String) { write(Data(hexToBytes(s)), label: "RAW") }
 
-    private func write(_ data: Data, label: String) {
-        guard let p = bike, let c = rxChar else { add("er", "not connected"); return }
-        let mtu = max(1, p.maximumWriteValueLength(for: .withoutResponse))
+    @discardableResult
+    private func write(_ data: Data, label: String) -> Bool {
+        guard let p = bike, let c = rxChar, connected, p.state == .connected else {
+            add("er", "Bluetooth transport is not ready")
+            return false
+        }
         let type: CBCharacteristicWriteType =
             c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-        add("tx", "\(label) (\(data.count)B): \(hex(data))")
+        let mtu = max(1, p.maximumWriteValueLength(for: type))
+        guard label != "AUTH" || data.count <= mtu else {
+            status = "authentication packet exceeds Bluetooth write size"
+            add("er", status)
+            return false
+        }
+        guard type != .withoutResponse || p.canSendWriteWithoutResponse else {
+            add("er", "Bluetooth write queue is busy")
+            return false
+        }
+        add("tx", "\(label) (\(data.count)B)")
         var i = 0
         while i < data.count {
             let end = min(i + mtu, data.count)
             p.writeValue(data.subdata(in: i..<end), for: c, type: type)
             i = end
         }
+        return true
     }
 
     // MARK: CBCentralManagerDelegate
     func centralManager(_ c: CBCentralManager, willRestoreState dict: [String : Any]) {
-        if let ps = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], let p = ps.first {
+        let saved = UserDefaults.standard.string(forKey: savedBikeKey)
+        if let ps = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
+           let p = ps.first(where: { $0.identifier.uuidString == saved }) {
             bike = p; p.delegate = self
-            add("ev", "restored peripheral in background")
+            wantsConnection = true
+            add("ev", "restored known bike")
         }
     }
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
-        switch c.state {
-        case .poweredOn: add("ev", "bluetooth on"); if autoReconnect { start() }
-        case .poweredOff: status = "bluetooth off"; connected = false
-        case .unauthorized: status = "no BT permission"; add("er", "Bluetooth permission denied — allow it in Settings")
-        default: status = "bt: \(c.state.rawValue)"
+        status = bluetoothStatus(c.state)
+        add(c.state == .poweredOn ? "ev" : "er", status)
+        if c.state == .poweredOn {
+            if let restored = bike {
+                beginConnection(restored)
+            } else if autoReconnect {
+                start()
+            }
+        } else if c.state != .unknown {
+            retry?.cancel()
+            deadline?.cancel()
+            clearLink()
         }
     }
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                         advertisementData: [String : Any], rssi: NSNumber) {
         let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = advName ?? p.name ?? ""
+        guard c.isScanning, bike == nil else { return }
         // update the discovered list (dedup by identifier)
         if let idx = found.firstIndex(where: { $0.id == p.identifier }) {
             found[idx].rssi = rssi.intValue
@@ -153,59 +309,99 @@ final class BikeBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPer
                                rssi: rssi.intValue, peripheral: p))
             add("ev", "found: \(name.isEmpty ? "(unnamed)" : name)  rssi \(rssi)")
         }
-        // auto-connect to anything that looks like the bike
-        let adv = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-        if name.uppercased().contains("YCCU") || adv.contains(NUS) {
-            add("ev", "that's the bike — connecting")
-            connectTo(p)
+        let expectedName = "YCCU_" + ccuId.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let saved = UserDefaults.standard.string(forKey: savedBikeKey)
+        let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
+        if allowAutomaticSelection, isConnectable,
+           name.uppercased() == expectedName || p.identifier.uuidString == saved {
+            beginConnection(p)
         }
     }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        status = "discovering"; connected = true
-        add("ev", "connected, discovering services")
-        p.discoverServices([NUS])
+        guard bike === p, status == "connecting" else { return }
+        discover(p)
     }
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        connected = false; status = "disconnected"
-        add("er", "disconnected\(error != nil ? ": \(error!.localizedDescription)" : "")")
-        if autoReconnect { add("ev", "reconnecting…"); central.connect(p, options: nil) }
+        guard bike === p else { return }
+        if let ready = linkReadyAt, Date().timeIntervalSince(ready) >= 60 { attempts = 0 }
+        fail("Bluetooth disconnected" + (error.map { ": \($0.localizedDescription)" } ?? ""))
     }
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        add("er", "connect failed\(error != nil ? ": \(error!.localizedDescription)" : "")")
-        if autoReconnect { central.connect(p, options: nil) }
+        guard bike === p else { return }
+        fail("Bluetooth connection failed" + (error.map { ": \($0.localizedDescription)" } ?? ""))
     }
 
     // MARK: CBPeripheralDelegate
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        if let e = error { add("er", "service discovery: \(e.localizedDescription)"); return }
+        guard bike === p else { return }
+        if let e = error { fail("service discovery: \(e.localizedDescription)", retryable: false); return }
         guard let svc = p.services?.first(where: { $0.uuid == NUS }) else {
-            add("er", "NUS service not found on this device")
             if let all = p.services { add("ev", "services: " + all.map{$0.uuid.uuidString}.joined(separator: ", ")) }
+            fail("bike Bluetooth service missing", retryable: false)
             return
         }
+        status = "discovering bike characteristics"
+        add("ev", status)
         p.discoverCharacteristics([RX, TX], for: svc)
+        setDeadline(seconds: 10) { $0.fail("characteristic discovery timed out", retryable: false) }
     }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor svc: CBService, error: Error?) {
-        for ch in svc.characteristics ?? [] {
-            if ch.uuid == RX { rxChar = ch }
-            if ch.uuid == TX { txChar = ch; p.setNotifyValue(true, for: ch) }
+        guard bike === p, svc.uuid == NUS else { return }
+        if let error = error {
+            fail("characteristic discovery: \(error.localizedDescription)", retryable: false)
+            return
         }
-        status = "authenticating"
-        add("ev", "characteristics ready — sending auth")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self = self else { return }
-            self.write(self.authFrame(), label: "AUTH")
+        guard let write = svc.characteristics?.first(where: { $0.uuid == RX }),
+              write.properties.contains(.write) || write.properties.contains(.writeWithoutResponse),
+              let notify = svc.characteristics?.first(where: { $0.uuid == TX }),
+              notify.properties.contains(.notify) || notify.properties.contains(.indicate) else {
+            fail("bike write or notification characteristic missing", retryable: false)
+            return
         }
+        rxChar = write
+        txChar = notify
+        status = "enabling bike notifications"
+        add("ev", status)
+        p.setNotifyValue(true, for: notify)
+        setDeadline(seconds: 10) { $0.fail("bike notification subscription timed out", retryable: false) }
+    }
+    func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
+        guard bike === p, txChar === ch else { return }
+        guard error == nil, ch.isNotifying else {
+            fail("bike notification subscription failed" + (error.map { ": \($0.localizedDescription)" } ?? ""), retryable: false)
+            return
+        }
+        guard !connected else { return }
+        deadline?.cancel()
+        connected = true
+        linkReadyAt = Date()
+        UserDefaults.standard.set(p.identifier.uuidString, forKey: savedBikeKey)
+        status = "Bluetooth ready — authentication pending"
+        add("ev", "bike notifications enabled")
+        sendAuth()
     }
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
-        guard ch.uuid == TX, let d = ch.value else { return }
+        guard bike === p, txChar === ch else { return }
+        if let error = error { add("er", "bike notification: \(error.localizedDescription)"); return }
+        guard let d = ch.value, !d.isEmpty else { return }
         rxCount += 1
         if d.count >= 2 { lastOpcode = String(format: "0x%02X%02X", d[0], d[1]) }
         let ascii = String(d.map { ($0 >= 32 && $0 < 127) ? Character(UnicodeScalar($0)) : "." })
         add("rx", "(\(d.count)B) \(hex(d))  | \(ascii)")
-        if status != "connected" { status = "connected" }
+        if waitingForAuth {
+            deadline?.cancel()
+            waitingForAuth = false
+            status = "bike replied — authentication unverified"
+            add("ev", "received data after AUTH; reply format has not been verified")
+        }
     }
     func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
-        if let e = error { add("er", "write error: \(e.localizedDescription)") }
+        guard bike === p, rxChar === ch, let error = error else { return }
+        if waitingForAuth {
+            deadline?.cancel()
+            waitingForAuth = false
+            status = "authentication write failed"
+        }
+        add("er", "write error: \(error.localizedDescription)")
     }
 }
