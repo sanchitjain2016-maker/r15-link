@@ -122,15 +122,9 @@ struct ContentView: View {
         NavigationView {
             Form {
                 Section("Credentials (from Yamaha cloud)") {
-                    LabeledTextField("ccuId (hex)", $ble.ccuId)
-                    LabeledTextField("passKey", $ble.passKey)
-                    Picker("passKey encoding", selection: $ble.passEncoding) {
-                        Text("ASCII").tag("ascii"); Text("hex").tag("hex")
-                        Text("uint32 BE").tag("int4"); Text("uint24 BE").tag("int3")
-                    }
-                }
-                Section("Auth frame preview") {
-                    Text(ble.hex(ble.authFrame())).font(.system(.footnote, design: .monospaced))
+                    LabeledTextField("Bike ID", $ble.ccuId)
+                    SecureField("Six-digit passkey", text: $ble.passKey)
+                        .keyboardType(.numberPad)
                 }
             }
             .navigationTitle("Settings")

@@ -6,6 +6,10 @@ workflows:
     environment:
       xcode: latest
     scripts:
+      - name: Verify SCCU authentication framing
+        script: |
+          swiftc App/SccuAuthentication.swift Tests/SccuAuthentication/main.swift -o "$TMPDIR/r15-auth-test"
+          "$TMPDIR/r15-auth-test"
       - name: Install XcodeGen
         script: brew install xcodegen
       - name: Generate Xcode project
